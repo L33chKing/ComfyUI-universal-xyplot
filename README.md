@@ -44,7 +44,7 @@ Place the folder under `ComfyUI/custom_nodes`
 - Search/replace: `'%search;replacement%'` substitutes into the current widget value.
 - Append: `widget_name.append` appends to the existing widget value.
 
-## What it does in practicce
+## What it does in practice
 
 1. Walks the graph upstream, copying the sub-graph.
 2. For each (Z, X, Y) combination, deep-copies the sub-graph, applies widget mutations, validates, and runs through a private executor.
