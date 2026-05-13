@@ -1,0 +1,18 @@
+[project]
+name = "xyplot-universal"
+version = "0.1.0"
+description = "universal XY/XYZ plot node for ComfyUI"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "Pillow",
+]
+
+[project.urls]
+homepage = "https://github.com/"
+
+[tool.comfy]
+PublisherId = "local"
+DisplayName = "XY Plot (Universal)"
+Icon = ""
