@@ -1,5 +1,16 @@
 /*
  * Frontend helper for the XY Plot (Universal) node.
+ *
+ * Restored to the original repo behavior (hover-cascade nested dropdown,
+ * mousedown-to-pick on leaves, position:absolute on body, focusout-based
+ * dismissal), plus three additions on top:
+ *   1. A "?" help button drawn in the node's title bar that opens a
+ *      compact syntax cheatsheet modal.
+ *   2. Silent stale-textarea recovery in _findOwningWidget /
+ *      _resolveLiveTextarea so the rare "stops working after running" bug
+ *      can heal itself when ComfyUI recreates the underlying <textarea>.
+ *   3. The legacy keyup-to-open handler is removed (typing into the
+ *      textbox no longer triggers the dropdown - that was confusing).
  */
 
 import { app } from "../../scripts/app.js";
@@ -114,6 +125,73 @@ function _injectStyle() {
 .xyplot-grid > [data-xyplot-role="full"] {
     grid-column: 1 / -1 !important;
 }
+
+/* ---------- Help modal ---------- */
+.xyplot-help-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.xyplot-help-modal {
+    background: #1d1d1d;
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 6px;
+    padding: 18px 22px;
+    max-width: 720px;
+    width: 90%;
+    max-height: 80vh;
+    overflow-y: auto;
+    font-family: system-ui;
+    font-size: 0.85rem;
+    line-height: 1.45;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.6);
+}
+.xyplot-help-modal h2 {
+    margin: 0 0 4px 0;
+    font-size: 1.05rem;
+}
+.xyplot-help-modal h3 {
+    margin: 16px 0 6px 0;
+    font-size: 0.92rem;
+    color: #79c0ff;
+}
+.xyplot-help-modal code {
+    background: #2a2a2a;
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-family: "Fira Code", Consolas, monospace;
+    font-size: 0.8rem;
+}
+.xyplot-help-modal pre {
+    background: #111;
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 6px 0 10px;
+    overflow-x: auto;
+    font-family: "Fira Code", Consolas, monospace;
+    font-size: 0.78rem;
+    color: #c9d1d9;
+}
+.xyplot-help-modal .close-row {
+    text-align: right;
+    margin-top: 12px;
+}
+.xyplot-help-modal button {
+    background: #2a2a2a;
+    color: #ddd;
+    border: 1px solid #555;
+    border-radius: 4px;
+    padding: 4px 14px;
+    cursor: pointer;
+    font-family: inherit;
+}
+.xyplot-help-modal button:hover { background: #3a3a3a; }
 `;
     document.head.appendChild(style);
 }
@@ -140,10 +218,46 @@ function _removeDropdown() {
 }
 
 /**
+ * Translate-on-wheel: hovering a list and using the scroll wheel slides the
+ * list up/down via CSS transform so off-viewport items become reachable. No
+ * scrollbar, no clipping. Each <ul> tracks its own offset; stopPropagation
+ * keeps parent and child lists scrolling independently.
+ */
+function _attachWheelScroll(ul) {
+    let offset = 0;
+    ul.addEventListener("wheel", (ev) => {
+        // Always claim wheel events on a list - prevents the event from
+        // bubbling up to a parent list and scrolling both at once.
+        ev.preventDefault();
+        ev.stopPropagation();
+        const rect = ul.getBoundingClientRect();
+        const naturalTop = rect.top - offset;
+        const naturalBottom = rect.bottom - offset;
+        const vh = window.innerHeight;
+        const margin = 8;
+        const minOffset = Math.min(0, vh - margin - naturalBottom);
+        const maxOffset = Math.max(0, margin - naturalTop);
+        if (minOffset === 0 && maxOffset === 0) return;
+        // One wheel tick = one row. Read the actual row height from the
+        // first direct child <li> so the step matches whatever font / padding
+        // is in effect.
+        const firstItem = ul.querySelector(":scope > li");
+        const step = firstItem ? firstItem.offsetHeight : 22;
+        const delta = Math.sign(ev.deltaY) * step;
+        let newOffset = offset - delta;
+        if (newOffset < minOffset) newOffset = minOffset;
+        if (newOffset > maxOffset) newOffset = maxOffset;
+        if (newOffset === offset) return;
+        offset = newOffset;
+        ul.style.transform = `translateY(${offset}px)`;
+    }, { passive: false });
+}
+
+/**
  * Build the entire nested dropdown tree synchronously, hover to expand
  * submenus, click leaf to pick. Mirrors the original ttNdropdown.js behavior.
  */
-function _showDropdown(inputEl, tree, onPick) {
+function _showDropdown(inputEl, tree, onPick, clickX, clickY) {
     _injectStyle();
     _removeDropdown();
 
@@ -155,8 +269,6 @@ function _showDropdown(inputEl, tree, onPick) {
             const child = dict[key];
             const li = document.createElement("li");
 
-            // Track hover: clear .selected on siblings and add to this one,
-            // so CSS `li.selected > ul` opens the nested submenu.
             li.addEventListener("mouseover", () => {
                 Array.from(container.children).forEach((s) => s.classList.remove("selected"));
                 li.classList.add("selected");
@@ -166,11 +278,31 @@ function _showDropdown(inputEl, tree, onPick) {
             if (isLeaf) {
                 li.classList.add("item");
                 li.textContent = key;
+                // mousedown only preventDefaults / stops propagation so the
+                // textarea stays focused and the outside-close listener
+                // doesn't fire. The actual pick is on `click`, because in
+                // the new Vue ComfyUI the canvas pointer layer intercepts
+                // mousedown on body-attached overlays before our handler
+                // can run - `click` survives that.
                 li.addEventListener("mousedown", (ev) => {
                     ev.preventDefault();
                     ev.stopPropagation();
-                    onPick([...pathParts, key], child);
-                    _removeDropdown();
+                });
+                li.addEventListener("click", (ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    console.log("[xyplot] pick:", key, ev.shiftKey ? "(shift)" : "");
+                    try {
+                        onPick([...pathParts, key], child);
+                    } catch (err) {
+                        console.error("[xyplot] pick failed:", err);
+                    }
+                    // Shift-click keeps the picker open for multi-select. Each
+                    // pick still writes its value (and adds the next header)
+                    // independently - they just don't dismiss the dropdown.
+                    if (!ev.shiftKey) {
+                        _removeDropdown();
+                    }
                 });
             } else {
                 li.classList.add("folder");
@@ -178,26 +310,31 @@ function _showDropdown(inputEl, tree, onPick) {
                 const nested = document.createElement("ul");
                 li.appendChild(nested);
                 buildLevel(nested, child, [...pathParts, key]);
+                _attachWheelScroll(nested);
             }
             container.appendChild(li);
         });
     };
 
     buildLevel(root, tree, []);
+    _attachWheelScroll(root);
 
-    // Anchor below the textarea (top-left, matching original look).
-    const rect = inputEl.getBoundingClientRect();
-    root.style.left = (rect.left + window.scrollX) + "px";
-    root.style.top = (rect.bottom + window.scrollY - 10) + "px";
+    // Anchor at the click position when we have it (so the list pops where
+    // the cursor is, not at the bottom of a long textbox). Fall back to the
+    // textbox bottom for keyboard / programmatic opens.
+    if (clickX != null && clickY != null) {
+        root.style.left = (clickX + window.scrollX) + "px";
+        root.style.top = (clickY + window.scrollY) + "px";
+    } else {
+        const rect = inputEl.getBoundingClientRect();
+        root.style.left = (rect.left + window.scrollX) + "px";
+        root.style.top = (rect.bottom + window.scrollY - 10) + "px";
+    }
 
     document.body.appendChild(root);
     _activeDropdown = root;
     _activeAnchor = inputEl;
 
-    // Dismiss when clicking outside both the dropdown and the textarea.
-    // We listen on window in capture phase + on pointerdown because the
-    // ComfyUI/Litegraph canvas consumes pointer events and the regular
-    // bubbling `mousedown` may never reach document otherwise.
     const onDocClick = (ev) => {
         const t = ev.target;
         if (root.contains(t)) return;
@@ -205,7 +342,6 @@ function _showDropdown(inputEl, tree, onPick) {
         _removeDropdown();
     };
     _activeOnDocClick = onDocClick;
-    // Defer attach so the click that opened us doesn't immediately close us.
     setTimeout(() => {
         window.addEventListener("mousedown", onDocClick, true);
         window.addEventListener("pointerdown", onDocClick, true);
@@ -266,7 +402,6 @@ function _widgetsFor(n) {
             out[w.name] = { [String(w.value)]: String(w.value) };
             continue;
         }
-        // combo
         if (w.options?.values) {
             const values = typeof w.options.values === "function"
                 ? w.options.values() : w.options.values;
@@ -311,9 +446,16 @@ function _findNextAxisNumber(text) {
     return Math.max(...matches.map(m => parseInt(m[1], 10))) + 1;
 }
 
+function _findLastLabelKind(text) {
+    /* Read the label kind from the last <n:label> header in the textbox so
+       auto-added headers match what the user is already using. Defaults to
+       v_label when the box has no headers yet. */
+    const matches = [...text.matchAll(/<\s*\d*\s*:\s*([^>\n]+)>/g)];
+    if (!matches.length) return 'v_label';
+    return matches[matches.length - 1][1].trim();
+}
+
 function _insertAtCursor(widget, value) {
-    // Always read the LIVE element from the widget - ComfyUI may have
-    // recreated the textarea since the dropdown was opened.
     const textarea = widget.inputEl;
     if (!textarea) return;
     const start = textarea.selectionStart ?? textarea.value.length;
@@ -325,14 +467,8 @@ function _insertAtCursor(widget, value) {
     textarea.value = newValue;
     const newPos = (before + sep + value).length;
     textarea.selectionStart = textarea.selectionEnd = newPos;
-    // Propagate to the widget object (ComfyUI persists from `widget.value`
-    // when the workflow is saved/queued). We deliberately do NOT dispatch
-    // a synthetic `input` event - ComfyUI's own input listener might react
-    // by re-rendering and would also re-trigger our open-on-input handler.
     widget.value = newValue;
     if (typeof widget.callback === "function") {
-        // Many widgets register a callback for value changes. Mirror the
-        // litegraph contract by invoking it directly.
         try { widget.callback(newValue); } catch (_) { /* ignore */ }
     }
 }
@@ -361,27 +497,20 @@ function _onPick(widget, pathParts, leafValue) {
     let value = leafValue == null ? pathParts[2] : leafValue;
     if (value === "__RANDOM_SEED__") value = String(Math.floor(Math.random() * 1e15));
 
-    let line = `[${nodeId}:${widgetName}='${value}']`;
-    if (text.trim() === "") {
-        line = `<1:v_label>\n${line}`;
-    }
+    // Every pick prepends its own fresh <n:label> header so each click
+    // becomes its own axis step. The label kind matches the last existing
+    // header in the textbox (v_label by default).
+    const labelKind = _findLastLabelKind(text);
+    const nextNum = _findNextAxisNumber(text);
+    const line = `<${nextNum}:${labelKind}>\n[${nodeId}:${widgetName}='${value}']`;
     _insertAtCursor(widget, line);
 }
 
 /* --------------------------------------------------------------- */
 /* Wire up textareas                                               */
-/*                                                                 */
-/* ComfyUI sometimes re-creates the underlying <textarea> for      */
-/* multiline widgets (resize / reconvert / hot-reload). We avoid   */
-/* the resulting "stale element" bugs by:                          */
-/*   - tagging the node (not the textarea) as wired, and           */
-/*   - delegating events at the document level, looking up the     */
-/*     owning node + widget on every event.                        */
 /* --------------------------------------------------------------- */
 const PLOT_WIDGET_NAMES = new Set(["x_plot", "y_plot", "z_plot"]);
 
-// Suppression flag is keyed off the widget object's identity so it
-// survives <textarea> re-creation.
 const _suppressOpenFor = new WeakSet();
 
 function _findOwningWidget(target) {
@@ -390,22 +519,49 @@ function _findOwningWidget(target) {
     for (const node of app.graph._nodes) {
         if (!node || node.type !== NODE_CLASS) continue;
         if (!node.widgets) continue;
+        // Fast path: identity match on inputEl.
         for (const w of node.widgets) {
             if (!PLOT_WIDGET_NAMES.has(w.name)) continue;
             if (w.inputEl === target) return { node, widget: w };
+        }
+        // Recovery: stale w.inputEl. Find the live textarea inside this
+        // node's DOM by placeholder hint (X_PLOT / Y_PLOT / Z_PLOT) or
+        // positional index, then heal the reference.
+        const nodeEl = document.querySelector(`[data-id="${node.id}"]`);
+        if (!nodeEl || !nodeEl.contains(target)) continue;
+        const ph = (target.placeholder || "").toLowerCase();
+        let claimed = null;
+        if (ph.startsWith("x")) claimed = "x_plot";
+        else if (ph.startsWith("y")) claimed = "y_plot";
+        else if (ph.startsWith("z")) claimed = "z_plot";
+        if (claimed) {
+            for (const w of node.widgets) {
+                if (w.name === claimed) {
+                    w.inputEl = target;
+                    return { node, widget: w };
+                }
+            }
+        }
+        const textareas = Array.from(nodeEl.querySelectorAll("textarea"));
+        const idx = textareas.indexOf(target);
+        if (idx >= 0) {
+            const plotWidgets = node.widgets.filter(w => PLOT_WIDGET_NAMES.has(w.name));
+            if (plotWidgets[idx]) {
+                plotWidgets[idx].inputEl = target;
+                return { node, widget: plotWidgets[idx] };
+            }
         }
     }
     return null;
 }
 
-function _openDropdownFor(node, widget) {
+function _openDropdownFor(node, widget, clickX, clickY) {
     if (_suppressOpenFor.has(widget)) return;
     if (!widget.inputEl) return;
     const tree = _buildTree(node);
     _showDropdown(widget.inputEl, tree, (parts, leaf) => {
-        // Always read the current live element from the widget at pick time.
         _onPick(widget, parts, leaf);
-    });
+    }, clickX, clickY);
 }
 
 let _delegationInstalled = false;
@@ -413,31 +569,28 @@ function _installDelegation() {
     if (_delegationInstalled) return;
     _delegationInstalled = true;
 
-    // Open on a real user click on the textarea. We use `mouseup` because it
-    // fires after the textarea has taken focus, matching the original
-    // tinyterra behavior. We require the event target to currently be the
-    // focused element so synthetic / re-entrant events can never trigger us.
+    // Open on a real user click on the textarea. If the dropdown is already
+    // open for this same textarea (the user clicked it a second time while
+    // it was still focused), toggle it closed instead.
     const userOpen = (ev) => {
         const owner = _findOwningWidget(ev.target);
         if (!owner) return;
         if (document.activeElement !== ev.target) return;
-        _openDropdownFor(owner.node, owner.widget);
+        if (_activeDropdown && _activeAnchor === owner.widget.inputEl) {
+            _removeDropdown();
+            return;
+        }
+        _openDropdownFor(owner.node, owner.widget, ev.clientX, ev.clientY);
     };
     document.addEventListener("mouseup", userOpen, true);
 
-    // Open on real keyboard input. `keyup` only fires from actual user typing
-    // (synthetic `input` events ComfyUI dispatches during workflow updates do
-    // NOT produce keyup events), which prevents the auto-popup glitch where
-    // a value-pick would immediately reopen the picker on another textbox.
-    document.addEventListener("keyup", (ev) => {
-        const owner = _findOwningWidget(ev.target);
-        if (!owner) return;
-        if (document.activeElement !== ev.target) return;
-        // Don't reopen on Escape / arrow keys / Tab / Enter etc.
-        if (ev.key && ev.key.length > 1 && ev.key !== "Backspace" && ev.key !== "Delete") {
-            return;
-        }
-        _openDropdownFor(owner.node, owner.widget);
+    // Typing in the textarea while the dropdown is open dismisses it -
+    // user is editing, not picking.
+    document.addEventListener("input", (ev) => {
+        if (!_activeDropdown) return;
+        if (!_activeAnchor) return;
+        if (ev.target !== _activeAnchor) return;
+        _removeDropdown();
     }, true);
 
     document.addEventListener("contextmenu", (ev) => {
@@ -445,13 +598,12 @@ function _installDelegation() {
         if (!owner) return;
         ev.preventDefault();
         ev.stopPropagation();
-        _openDropdownFor(owner.node, owner.widget);
+        _openDropdownFor(owner.node, owner.widget, ev.clientX, ev.clientY);
     }, true);
 
     document.addEventListener("focusout", (ev) => {
         const owner = _findOwningWidget(ev.target);
         if (!owner) return;
-        // Defer so a click on a dropdown <li> can fire its own pick first.
         setTimeout(() => {
             if (!_activeDropdown) return;
             if (_activeAnchor !== owner.widget.inputEl) return;
@@ -460,6 +612,109 @@ function _installDelegation() {
             _removeDropdown();
         }, 100);
     }, true);
+}
+
+/* --------------------------------------------------------------- */
+/* Help modal                                                      */
+/* --------------------------------------------------------------- */
+let _activeHelpModal = null;
+function _closeHelpModal() {
+    if (_activeHelpModal && _activeHelpModal.parentNode) {
+        _activeHelpModal.parentNode.removeChild(_activeHelpModal);
+    }
+    _activeHelpModal = null;
+}
+
+function _showHelpModal() {
+    _injectStyle();
+    _closeHelpModal();
+    const backdrop = document.createElement("div");
+    backdrop.className = "xyplot-help-backdrop";
+    backdrop.addEventListener("mousedown", (ev) => {
+        if (ev.target === backdrop) _closeHelpModal();
+    });
+    const modal = document.createElement("div");
+    modal.className = "xyplot-help-modal";
+    const C = (s) => `<span style="color:#888">${s}</span>`;
+    modal.innerHTML = `
+        <h2>XY Plot — Cheatsheet</h2>
+
+        <h3>Step</h3>
+<pre>&lt;1:v_label&gt;             ${C("# header: ordinal + label")}
+&lt;:v_label&gt;              ${C("# blank ordinal = auto-numbered")}
+[5:steps='20']          ${C("# node 5, widget 'steps', value 20")}
+[5:cfg='7.5']           ${C("# co-vary several widgets in one cell")}
+# comment line          ${C("# full-line comments are ignored")}</pre>
+
+        <h3>Labels</h3>
+<pre>v_label                 ${C("# 20, 7.5")}
+tv_label                ${C("# steps: 20, cfg: 7.5")}
+idtv_label              ${C("# [5] steps: 20, [5] cfg: 7.5")}
+my custom text          ${C("# anything else = literal")}</pre>
+
+        <h3>Ranges</h3>
+<pre>range(10, 40, 10)       ${C("# 10, 20, 30   (end-exclusive; step optional)")}
+linspace(1.0, 10.0, 5)  ${C("# 1, 3.25, 5.5, 7.75, 10")}
+{a, b, c}               ${C("# explicit list")}
+*                       ${C("# all legal values of a combo widget")}
+random_seed(4)          ${C("# 4 fresh seeds")}
+random(1.0, 10.0, 5)    ${C("# 5 random numbers in [1, 10]")}</pre>
+        ${C("// Several ranges in one step are zipped (same length, no Cartesian).")}
+
+        <h3>Text tricks</h3>
+<pre>[7:text.append=', cinematic']   ${C("# append to existing value")}
+[7:text='%dog;cat%']            ${C("# search;replace existing value")}</pre>
+
+        <div class="close-row"><button type="button">Close</button></div>
+    `;
+    modal.querySelector("button").addEventListener("click", _closeHelpModal);
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    _activeHelpModal = backdrop;
+    const onKey = (ev) => {
+        if (ev.key === "Escape") {
+            _closeHelpModal();
+            window.removeEventListener("keydown", onKey, true);
+        }
+    };
+    window.addEventListener("keydown", onKey, true);
+}
+
+/* --------------------------------------------------------------- */
+/* Help "?" button in title bar                                    */
+/* --------------------------------------------------------------- */
+const HELP_RADIUS = 7;
+function _helpButtonCenter(node) {
+    return {
+        x: node.size[0] - 18,
+        y: -LiteGraph.NODE_TITLE_HEIGHT / 2,
+    };
+}
+
+function _drawHelpButton(node, ctx) {
+    if (node.flags && node.flags.collapsed) return;
+    const c = _helpButtonCenter(node);
+    ctx.save();
+    ctx.fillStyle = "#444";
+    ctx.strokeStyle = "#aaa";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, HELP_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#eee";
+    ctx.font = "bold 10px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("?", c.x, c.y + 0.5);
+    ctx.restore();
+}
+
+function _hitHelpButton(node, pos) {
+    const c = _helpButtonCenter(node);
+    const dx = pos[0] - c.x;
+    const dy = pos[1] - c.y;
+    return (dx * dx + dy * dy) <= (HELP_RADIUS * HELP_RADIUS + 4);
 }
 
 /* --------------------------------------------------------------- */
@@ -530,7 +785,6 @@ function _cleanupLayoutObserver(node) {
 /* Strip legacy `passthrough` slot from old workflows              */
 /* --------------------------------------------------------------- */
 function _stripLegacyPassthrough(node) {
-    // Inputs
     if (Array.isArray(node.inputs)) {
         for (let i = node.inputs.length - 1; i >= 0; i--) {
             if (node.inputs[i] && node.inputs[i].name === "passthrough") {
@@ -542,7 +796,6 @@ function _stripLegacyPassthrough(node) {
             }
         }
     }
-    // Outputs
     if (Array.isArray(node.outputs)) {
         for (let i = node.outputs.length - 1; i >= 0; i--) {
             if (node.outputs[i] && node.outputs[i].name === "passthrough") {
@@ -559,8 +812,6 @@ function _stripLegacyPassthrough(node) {
 app.registerExtension({
     name: "xyplot_universal.frontend",
     async setup() {
-        // One delegated event handler set serves every plot node, regardless
-        // of how many times ComfyUI re-creates the underlying <textarea>.
         _installDelegation();
     },
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -591,6 +842,23 @@ app.registerExtension({
             const r = onRemoved ? onRemoved.apply(this, arguments) : undefined;
             _cleanupLayoutObserver(this);
             return r;
+        };
+
+        // Help "?" button on the title bar.
+        const onDrawForeground = nodeType.prototype.onDrawForeground;
+        nodeType.prototype.onDrawForeground = function (ctx) {
+            const r = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
+            _drawHelpButton(this, ctx);
+            return r;
+        };
+
+        const onMouseDown = nodeType.prototype.onMouseDown;
+        nodeType.prototype.onMouseDown = function (e, pos, graphCanvas) {
+            if (_hitHelpButton(this, pos)) {
+                _showHelpModal();
+                return true;
+            }
+            return onMouseDown ? onMouseDown.apply(this, arguments) : undefined;
         };
     },
 });

@@ -42,6 +42,7 @@ You can also append to an existing widget value with `widget_name.append`.
 
 import copy
 import os
+import random
 import re
 import uuid
 import asyncio
@@ -82,20 +83,57 @@ ANY_TYPE = AnyType("*")
 
 
 # --------------------------------------------------------------------------- #
-# Plot text parsing - same format as tinyterraNodes' advanced xyPlot.
+# Plot text parsing - extended from tinyterraNodes' advanced xyPlot format.
 # --------------------------------------------------------------------------- #
+def _strip_comments(text):
+    """Drop full-line `#` comments. Lines whose first non-whitespace char is
+    `#` are removed; mid-line `#` is left alone (lora tags can legitimately
+    contain it)."""
+    return '\n'.join(
+        line for line in text.splitlines()
+        if not line.lstrip().startswith('#')
+    )
+
+
+def _render_label(label_kind, value_list):
+    """Render an axis-step label from its raw values, given a label kind.
+    Literal labels are returned unchanged."""
+    if label_kind in ('v_label', 'tv_label', 'idtv_label'):
+        parts = []
+        for value, input_name, node_id in value_list:
+            if label_kind == 'v_label':
+                parts.append(str(value))
+            elif label_kind == 'tv_label':
+                parts.append(f'{input_name}: {value}')
+            else:
+                parts.append(f'[{node_id}] {input_name}: {value}')
+        return ', '.join(parts)
+    return label_kind
+
+
 def _parse_plot_text(plot_data, axis_label="X"):
     """Parse a plot definition string into an OrderedDict keyed by axis-step.
 
     Each value is a dict::
 
         {
-            "label": "<text>",
+            "label": "<rendered text>",
+            "_label_kind": "<literal>|v_label|tv_label|idtv_label",
+            "_value_list": [(value, input_name, node_id), ...],
             "<node_id>": {"<widget_name>": "<value>", ...},
             ...
         }
+
+    Supports:
+      - `#` line comments (full-line)
+      - `<:label>` auto-numbered axis headers
+      - Per-widget value expressions (range/linspace/{...}/*) — expanded later
     """
     if plot_data is None or plot_data.strip() == '':
+        return None
+
+    plot_data = _strip_comments(plot_data)
+    if plot_data.strip() == '':
         return None
 
     try:
@@ -109,6 +147,7 @@ def _parse_plot_text(plot_data, axis_label="X"):
             else:
                 merged.append(line)
 
+        auto_num = 1
         for raw in merged:
             if not raw:
                 continue
@@ -117,7 +156,17 @@ def _parse_plot_text(plot_data, axis_label="X"):
                 continue
             num, label = head.split(':', 1)
             num = num.strip()
-            axis_dict[num] = {"label": label}
+            if num == '':
+                # `<:label>` - auto-number this header.
+                num = str(auto_num)
+            # Bump auto-num past whatever explicit number was used so future
+            # `<:label>` headers don't collide with it.
+            try:
+                auto_num = max(auto_num, int(num) + 1)
+            except ValueError:
+                auto_num += 1
+
+            axis_dict[num] = {"label": label, "_label_kind": label}
 
             values_label = []
             for chunk in body.split('['):
@@ -140,20 +189,224 @@ def _parse_plot_text(plot_data, axis_label="X"):
                 axis_dict[num].setdefault(node_id, {})[input_name] = value
                 values_label.append((value, input_name, node_id))
 
-            if label in ('v_label', 'tv_label', 'idtv_label'):
-                rendered = []
-                for value, input_name, node_id in values_label:
-                    if label == 'v_label':
-                        rendered.append(value)
-                    elif label == 'tv_label':
-                        rendered.append(f'{input_name}: {value}')
-                    else:
-                        rendered.append(f'[{node_id}] {input_name}: {value}')
-                axis_dict[num]['label'] = ', '.join(rendered)
+            axis_dict[num]["_value_list"] = values_label
+            axis_dict[num]["label"] = _render_label(label, values_label)
     except ValueError:
         logging.warning(f"xyplot_universal: invalid {axis_label} plot - ignoring.")
         return None
+    # Drop axis steps that have a header but no widget mutations under it.
+    # The picker auto-appends a trailing <n:label> after every pick so the
+    # next pick starts a fresh step; the last one is dangling until it gets
+    # filled in. Treating it as a real step would plot a blank cell.
+    axis_dict = OrderedDict(
+        (k, v) for k, v in axis_dict.items() if v.get("_value_list")
+    )
     return axis_dict
+
+
+# --------------------------------------------------------------------------- #
+# Range / list / combo expansion.
+# A single axis step containing a `range(...)`, `linspace(...)`, `{a,b,c}`,
+# `*`, `random_seed(n)` or `random(a,b,n)` expression on one or more widgets
+# is expanded into multiple steps. If several widgets in the same step use
+# expansions they are zipped together (lengths must match).
+# --------------------------------------------------------------------------- #
+_RE_RANGE = re.compile(
+    r'^\s*range\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)'
+    r'(?:\s*,\s*(-?\d+(?:\.\d+)?))?\s*\)\s*$'
+)
+_RE_LINSPACE = re.compile(
+    r'^\s*linspace\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)'
+    r'\s*,\s*(\d+)\s*\)\s*$'
+)
+_RE_RANDOM_SEED = re.compile(r'^\s*random_seed\s*\(\s*(\d+)\s*\)\s*$')
+_RE_RANDOM = re.compile(
+    r'^\s*random\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)'
+    r'\s*,\s*(\d+)\s*\)\s*$'
+)
+_RE_LIST = re.compile(r'^\s*\{\s*(.+?)\s*\}\s*$')
+
+
+def _is_int_widget(prompt, node_id, widget_name):
+    """Best-effort: is this widget INT-typed? Used to pick int vs float for
+    numeric range output. Falls back to float if unknown."""
+    try:
+        ct = prompt[node_id]['class_type']
+        td = COMFY_CLASS_MAPPINGS[ct].INPUT_TYPES()
+        for itype in ('required', 'optional'):
+            d = td.get(itype) or {}
+            if widget_name in d and d[widget_name]:
+                return d[widget_name][0] == 'INT'
+    except Exception:
+        pass
+    return False
+
+
+def _combo_values(prompt, node_id, widget_name):
+    """Return the list of legal combo values for a widget, or None."""
+    try:
+        ct = prompt[node_id]['class_type']
+        td = COMFY_CLASS_MAPPINGS[ct].INPUT_TYPES()
+        for itype in ('required', 'optional'):
+            d = td.get(itype) or {}
+            if widget_name in d and d[widget_name]:
+                kind = d[widget_name][0]
+                if isinstance(kind, list):
+                    return [str(v) for v in kind]
+    except Exception:
+        pass
+    return None
+
+
+def _frange(start, stop, step):
+    """Python-style numeric range supporting floats and negative steps."""
+    if step == 0:
+        raise ValueError("range step cannot be zero")
+    out = []
+    n = start
+    # Use a small epsilon-free loop driven by an index to avoid drift.
+    i = 0
+    while True:
+        v = start + i * step
+        if step > 0 and v >= stop:
+            break
+        if step < 0 and v <= stop:
+            break
+        out.append(v)
+        i += 1
+        if i > 10000:
+            raise ValueError("range expands to too many values (>10000)")
+    return out
+
+
+def _format_number(v, as_int):
+    if as_int:
+        return str(int(round(v)))
+    # Trim trailing zeros for readability while keeping floats precise.
+    s = f"{v:.6f}".rstrip('0').rstrip('.')
+    return s or '0'
+
+
+def _try_expand_value(value, prompt, node_id, widget_name):
+    """If `value` is a range/list/combo-star expression, return a list of
+    expanded string values. Otherwise return None."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v:
+        return None
+
+    # Combo wildcard
+    if v == '*':
+        return _combo_values(prompt, node_id, widget_name)
+
+    m = _RE_RANGE.match(v)
+    if m:
+        a = float(m.group(1)); b = float(m.group(2))
+        step = float(m.group(3)) if m.group(3) is not None else None
+        if step is None:
+            # Sensible default: int widgets step by 1, floats by (b-a)/10.
+            step = 1.0 if _is_int_widget(prompt, node_id, widget_name) else (b - a) / 10.0
+        as_int = (
+            _is_int_widget(prompt, node_id, widget_name)
+            and step == int(step) and a == int(a) and b == int(b)
+        )
+        nums = _frange(a, b, step)
+        return [_format_number(x, as_int) for x in nums]
+
+    m = _RE_LINSPACE.match(v)
+    if m:
+        a = float(m.group(1)); b = float(m.group(2)); n = int(m.group(3))
+        if n <= 0:
+            return []
+        if n == 1:
+            return [_format_number(a, _is_int_widget(prompt, node_id, widget_name))]
+        as_int = _is_int_widget(prompt, node_id, widget_name)
+        step = (b - a) / (n - 1)
+        return [_format_number(a + i * step, as_int) for i in range(n)]
+
+    m = _RE_RANDOM_SEED.match(v)
+    if m:
+        n = int(m.group(1))
+        return [str(random.randint(0, 2**31 - 1)) for _ in range(n)]
+
+    m = _RE_RANDOM.match(v)
+    if m:
+        a = float(m.group(1)); b = float(m.group(2)); n = int(m.group(3))
+        as_int = _is_int_widget(prompt, node_id, widget_name)
+        if as_int:
+            lo, hi = int(min(a, b)), int(max(a, b))
+            return [str(random.randint(lo, hi)) for _ in range(n)]
+        return [_format_number(random.uniform(a, b), False) for _ in range(n)]
+
+    m = _RE_LIST.match(v)
+    if m:
+        inner = m.group(1)
+        # Split on commas; preserve internal whitespace inside items but
+        # trim each item's outer whitespace.
+        items = [p.strip() for p in inner.split(',')]
+        items = [p for p in items if p != '']
+        return items if items else None
+
+    return None
+
+
+def _expand_axis(axis_dict, prompt, axis_label="X"):
+    """Expand any range/list/combo expressions in an axis dict. Multi-widget
+    expansions in the same step are zipped (lengths must match). Steps with
+    no expansion are passed through unchanged."""
+    if axis_dict is None:
+        return None
+    out = OrderedDict()
+    next_step = 1
+    for step_key, entry in axis_dict.items():
+        expansions = []   # list of (node_id, widget_name, [values])
+        static = OrderedDict()  # node_id -> OrderedDict(widget_name -> value)
+        for node_id, widget_inputs in entry.items():
+            if node_id in ("label", "_label_kind", "_value_list"):
+                continue
+            for w, val in widget_inputs.items():
+                exp = _try_expand_value(val, prompt, node_id, w)
+                if exp is not None:
+                    expansions.append((node_id, w, exp))
+                else:
+                    static.setdefault(node_id, OrderedDict())[w] = val
+
+        if not expansions:
+            new_entry = copy.deepcopy(entry)
+            out[str(next_step)] = new_entry
+            next_step += 1
+            continue
+
+        lengths = {len(exp) for _, _, exp in expansions}
+        if len(lengths) > 1:
+            raise ValueError(
+                f"xyplot_universal: {axis_label} axis step {step_key} has "
+                f"expansions of mismatched lengths: {sorted(lengths)}. "
+                "When multiple widgets in one step use range/list, they must "
+                "produce the same number of values (they are zipped)."
+            )
+        n = lengths.pop()
+        if n == 0:
+            continue  # empty expansion - skip the step entirely
+
+        label_kind = entry.get("_label_kind", entry.get("label", ""))
+
+        for i in range(n):
+            new_entry = {"_label_kind": label_kind}
+            value_list = []
+            for nid, ws in static.items():
+                new_entry[nid] = dict(ws)
+                for wn, wv in ws.items():
+                    value_list.append((wv, wn, nid))
+            for nid, w, exp in expansions:
+                new_entry.setdefault(nid, {})[w] = exp[i]
+                value_list.append((exp[i], w, nid))
+            new_entry["_value_list"] = value_list
+            new_entry["label"] = _render_label(label_kind, value_list)
+            out[str(next_step)] = new_entry
+            next_step += 1
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -383,7 +636,7 @@ class XYPlotUniversalNode:
 
     def _apply_axis_mutations(self, prompt, axis_dict_entry, regex):
         for node_id, inputs in axis_dict_entry.items():
-            if node_id == 'label':
+            if node_id in ('label', '_label_kind', '_value_list'):
                 continue
             if node_id not in prompt:
                 raise KeyError(
@@ -600,6 +853,13 @@ class XYPlotUniversalNode:
             raise Exception(
                 "xyplot_universal: cannot access workflow prompt for "
                 "sub-graph execution.")
+
+        # Expand range/list/combo expressions into individual steps. Done
+        # against the live prompt so widget types (INT vs FLOAT, combo legal
+        # values) can drive expansion decisions.
+        x_points = _expand_axis(x_points, prompt, "X")
+        y_points = _expand_axis(y_points, prompt, "Y")
+        z_points = _expand_axis(z_points, prompt, "Z")
 
         base_prompt = self._build_base_prompt(prompt, my_unique_id)
         regex = re.compile(r'%(.*?);(.*?)%')

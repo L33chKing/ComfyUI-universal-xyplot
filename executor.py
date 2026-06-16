@@ -28,6 +28,43 @@ except Exception:  # pragma: no cover - older ComfyUI versions
             return klass.__qualname__
         return module + "." + klass.__qualname__
 
+# V3 node support (ComfyUI's newer node API with dynamic / dot-notation inputs).
+# Optional - older ComfyUI versions without the V3 API still work via the V1 path.
+try:
+    from comfy_api.internal import (
+        _ComfyNodeInternal,
+        _NodeOutputInternal,
+        is_class as _v3_is_class,
+        make_locked_method_func as _v3_make_locked_method_func,
+    )
+    from comfy_api.latest import io as _v3_io, _io as _v3_io_module
+    _V3_AVAILABLE = True
+except Exception:  # pragma: no cover - older ComfyUI
+    _ComfyNodeInternal = None
+    _NodeOutputInternal = None
+    _v3_is_class = None
+    _v3_make_locked_method_func = None
+    _v3_io = None
+    _v3_io_module = None
+    _V3_AVAILABLE = False
+
+
+def _is_v3_class(class_def):
+    return (
+        _V3_AVAILABLE
+        and _ComfyNodeInternal is not None
+        and isinstance(class_def, type)
+        and issubclass(class_def, _ComfyNodeInternal)
+    )
+
+
+def _is_v3_obj(obj):
+    if not _V3_AVAILABLE or _ComfyNodeInternal is None:
+        return False
+    if isinstance(obj, _ComfyNodeInternal):
+        return True
+    return _is_v3_class(obj)
+
 
 # Class types whose execution must be intercepted (replaced with a no-op fake
 # class) when re-running the upstream sub-graph, so we don't recurse forever
@@ -54,7 +91,13 @@ def get_input_data(inputs, class_def, unique_id, outputs=None, prompt=None, extr
     if extra_data is None:
         extra_data = {}
 
+    is_v3 = _is_v3_class(class_def)
     valid_inputs = class_def.INPUT_TYPES()
+    v3_data = {}
+    v3_hidden = None
+    if is_v3:
+        valid_inputs, v3_hidden, v3_data = _v3_io_module.get_finalized_class_inputs(valid_inputs, inputs)
+
     input_data_all = {}
     for x in inputs:
         input_data = inputs[x]
@@ -71,19 +114,52 @@ def get_input_data(inputs, class_def, unique_id, outputs=None, prompt=None, extr
                     or ("optional" in valid_inputs and x in valid_inputs["optional"])):
                 input_data_all[x] = [input_data]
 
-    if "hidden" in valid_inputs:
-        h = valid_inputs["hidden"]
-        for x in h:
-            if h[x] == "PROMPT":
-                input_data_all[x] = [prompt]
-            if h[x] == "EXTRA_PNGINFO":
-                input_data_all[x] = [extra_data.get('extra_pnginfo', None)]
-            if h[x] == "UNIQUE_ID":
-                input_data_all[x] = [unique_id]
-    return input_data_all
+    if is_v3:
+        hidden_inputs_v3 = {}
+        if v3_hidden is not None:
+            H = _v3_io.Hidden
+            if H.prompt.name in v3_hidden:
+                hidden_inputs_v3[H.prompt] = prompt
+            if H.dynprompt.name in v3_hidden:
+                hidden_inputs_v3[H.dynprompt] = None
+            if H.extra_pnginfo.name in v3_hidden:
+                hidden_inputs_v3[H.extra_pnginfo] = extra_data.get('extra_pnginfo', None)
+            if H.unique_id.name in v3_hidden:
+                hidden_inputs_v3[H.unique_id] = unique_id
+            if H.auth_token_comfy_org.name in v3_hidden:
+                hidden_inputs_v3[H.auth_token_comfy_org] = extra_data.get("auth_token_comfy_org", None)
+            if H.api_key_comfy_org.name in v3_hidden:
+                hidden_inputs_v3[H.api_key_comfy_org] = extra_data.get("api_key_comfy_org", None)
+        v3_data["hidden_inputs"] = hidden_inputs_v3
+    else:
+        if "hidden" in valid_inputs:
+            h = valid_inputs["hidden"]
+            for x in h:
+                if h[x] == "PROMPT":
+                    input_data_all[x] = [prompt]
+                if h[x] == "EXTRA_PNGINFO":
+                    input_data_all[x] = [extra_data.get('extra_pnginfo', None)]
+                if h[x] == "UNIQUE_ID":
+                    input_data_all[x] = [unique_id]
+    return input_data_all, v3_data
 
 
-def map_node_over_list(obj, input_data_all, func, allow_interrupt=False):
+def _resolve_v3_call(obj, func, inputs, v3_data):
+    """For V3 nodes, build a locked-method callable bound to a class clone and
+    restructure flat dot-notation inputs into the nested form the node expects."""
+    if _v3_is_class(obj):
+        type_obj = obj
+    else:
+        type_obj = type(obj)
+    type_obj.VALIDATE_CLASS()
+    class_clone = type_obj.PREPARE_CLASS_CLONE(v3_data or {})
+    f = _v3_make_locked_method_func(type_obj, func, class_clone)
+    if v3_data:
+        inputs = _v3_io_module.build_nested_inputs(inputs, v3_data)
+    return f, inputs
+
+
+def map_node_over_list(obj, input_data_all, func, allow_interrupt=False, v3_data=None):
     input_is_list = False
     if hasattr(obj, "INPUT_IS_LIST"):
         input_is_list = obj.INPUT_IS_LIST
@@ -96,28 +172,50 @@ def map_node_over_list(obj, input_data_all, func, allow_interrupt=False):
     def slice_dict(d, i):
         return {k: (v[i] if len(v) > i else v[-1]) for k, v in d.items()}
 
+    is_v3 = _is_v3_obj(obj)
+
+    def call(inputs):
+        if is_v3:
+            f, inputs = _resolve_v3_call(obj, func, inputs, v3_data)
+            return f(**inputs)
+        return getattr(obj, func)(**inputs)
+
     results = []
     if input_is_list:
         if allow_interrupt:
             nodes.before_node_execution()
-        results.append(getattr(obj, func)(**input_data_all))
+        results.append(call(input_data_all))
     elif max_len_input == 0:
         if allow_interrupt:
             nodes.before_node_execution()
-        results.append(getattr(obj, func)())
+        results.append(call({}))
     else:
         for i in range(max_len_input):
             if allow_interrupt:
                 nodes.before_node_execution()
-            results.append(getattr(obj, func)(**slice_dict(input_data_all, i)))
+            results.append(call(slice_dict(input_data_all, i)))
     return results
 
 
-def get_output_data(obj, input_data_all):
+def _coerce_v3_return(r, obj):
+    """Convert a V3 NodeOutput into the (result, ui) shape the rest of the
+    executor already understands. Returns a dict like the V1 protocol."""
+    if _NodeOutputInternal is None or not isinstance(r, _NodeOutputInternal):
+        return r
+    out = {}
+    if r.ui is not None:
+        out['ui'] = r.ui if isinstance(r.ui, dict) else r.ui.as_dict()
+    if r.result is not None:
+        out['result'] = r.result
+    return out
+
+
+def get_output_data(obj, input_data_all, v3_data=None):
     results = []
     uis = []
-    return_values = map_node_over_list(obj, input_data_all, obj.FUNCTION, allow_interrupt=True)
+    return_values = map_node_over_list(obj, input_data_all, obj.FUNCTION, allow_interrupt=True, v3_data=v3_data)
     for r in return_values:
+        r = _coerce_v3_return(r, obj)
         if isinstance(r, dict):
             if 'ui' in r:
                 uis.append(r['ui'])
@@ -188,14 +286,14 @@ def recursive_execute(prompt, outputs, current_item, extra_data, executed,
 
     input_data_all = None
     try:
-        input_data_all = get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
+        input_data_all, v3_data = get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
 
         obj = object_storage.get((unique_id, class_type), None)
         if obj is None:
             obj = class_def()
             object_storage[(unique_id, class_type)] = obj
 
-        output_data, output_ui = get_output_data(obj, input_data_all)
+        output_data, output_ui = get_output_data(obj, input_data_all, v3_data=v3_data)
         outputs[unique_id] = output_data
         if len(output_ui) > 0:
             outputs_ui[unique_id] = output_ui
@@ -267,10 +365,10 @@ def recursive_output_delete_if_changed(prompt, old_prompt, outputs, current_item
         if unique_id in old_prompt and 'is_changed' in old_prompt[unique_id]:
             is_changed_old = old_prompt[unique_id]['is_changed']
         if 'is_changed' not in prompt[unique_id]:
-            input_data_all = get_input_data(inputs, class_def, unique_id, outputs)
+            input_data_all, v3_data = get_input_data(inputs, class_def, unique_id, outputs)
             if input_data_all is not None:
                 try:
-                    is_changed = map_node_over_list(class_def, input_data_all, "IS_CHANGED")
+                    is_changed = map_node_over_list(class_def, input_data_all, "IS_CHANGED", v3_data=v3_data)
                     prompt[unique_id]['is_changed'] = is_changed
                 except Exception:
                     to_delete = True
