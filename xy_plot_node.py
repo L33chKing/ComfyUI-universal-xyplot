@@ -181,9 +181,13 @@ def _parse_plot_text(plot_data, axis_label="X"):
                     continue
                 input_name, _, value_part = rest.partition('=')
                 input_name = input_name.strip()
-                # Value is the text between the first pair of quotes.
-                if "'" in value_part:
-                    value = value_part.split("'", 2)[1]
+                # Value is the text between the FIRST and LAST single quote,
+                # so apostrophes inside the prompt (she's, it's, don't, etc.)
+                # don't truncate the value.
+                first_q = value_part.find("'")
+                last_q = value_part.rfind("'")
+                if first_q != -1 and last_q > first_q:
+                    value = value_part[first_q + 1:last_q]
                 else:
                     value = value_part.strip()
                 axis_dict[num].setdefault(node_id, {})[input_name] = value

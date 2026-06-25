@@ -278,32 +278,38 @@ function _showDropdown(inputEl, tree, onPick, clickX, clickY) {
             if (isLeaf) {
                 li.classList.add("item");
                 li.textContent = key;
-                // mousedown only preventDefaults / stops propagation so the
-                // textarea stays focused and the outside-close listener
-                // doesn't fire. The actual pick is on `click`, because in
-                // the new Vue ComfyUI the canvas pointer layer intercepts
-                // mousedown on body-attached overlays before our handler
-                // can run - `click` survives that.
-                li.addEventListener("mousedown", (ev) => {
+                // Multi-event pick: in some ComfyUI states (after running
+                // + tab switch, the canvas pointer layer can swallow `click`
+                // before it reaches us. We register pointerup / mouseup /
+                // click and dedupe via a per-li flag - whichever event fires
+                // first wins. The log records which event won, so we can see
+                // which one is actually getting through.
+                const doPick = (kind) => (ev) => {
+                    if (li._xyplotPickFired) return;
+                    li._xyplotPickFired = true;
+                    setTimeout(() => { li._xyplotPickFired = false; }, 300);
                     ev.preventDefault();
                     ev.stopPropagation();
-                });
-                li.addEventListener("click", (ev) => {
-                    ev.preventDefault();
-                    ev.stopPropagation();
-                    console.log("[xyplot] pick:", key, ev.shiftKey ? "(shift)" : "");
+                    console.log("[xyplot] pick(" + kind + "):", key,
+                        ev.shiftKey ? "(shift)" : "");
                     try {
                         onPick([...pathParts, key], child);
                     } catch (err) {
                         console.error("[xyplot] pick failed:", err);
                     }
-                    // Shift-click keeps the picker open for multi-select. Each
-                    // pick still writes its value (and adds the next header)
-                    // independently - they just don't dismiss the dropdown.
                     if (!ev.shiftKey) {
                         _removeDropdown();
                     }
+                };
+                // mousedown only preserves focus + stops the outside-close
+                // listener; the pick fires on the up/click events below.
+                li.addEventListener("mousedown", (ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
                 });
+                li.addEventListener("pointerup", doPick("pointerup"));
+                li.addEventListener("mouseup", doPick("mouseup"));
+                li.addEventListener("click", doPick("click"));
             } else {
                 li.classList.add("folder");
                 li.textContent = key;
@@ -455,8 +461,41 @@ function _findLastLabelKind(text) {
     return matches[matches.length - 1][1].trim();
 }
 
+function _resolveLiveTextarea(widget) {
+    /* widget.inputEl may point to a detached <textarea> after a run -
+       ComfyUI rebuilds DOM on rerender without always updating the ref.
+       Re-find the live one by placeholder hint (x/y/z_plot) or positional
+       index, patch widget.inputEl, and return it. */
+    const ta = widget.inputEl;
+    if (ta && ta.isConnected) return ta;
+    if (!app.graph || !app.graph._nodes) return ta;
+    for (const node of app.graph._nodes) {
+        if (!node || node.type !== NODE_CLASS) continue;
+        if (!node.widgets || !node.widgets.includes(widget)) continue;
+        const nodeEl = document.querySelector(`[data-id="${node.id}"]`);
+        if (!nodeEl) break;
+        const textareas = Array.from(nodeEl.querySelectorAll("textarea"));
+        const wantPrefix = (widget.name || "")[0];
+        for (const t of textareas) {
+            const ph = (t.placeholder || "").toLowerCase();
+            if (ph.startsWith(wantPrefix)) {
+                widget.inputEl = t;
+                return t;
+            }
+        }
+        const plotWidgets = node.widgets.filter(w => PLOT_WIDGET_NAMES.has(w.name));
+        const idx = plotWidgets.indexOf(widget);
+        if (idx >= 0 && textareas[idx]) {
+            widget.inputEl = textareas[idx];
+            return textareas[idx];
+        }
+        break;
+    }
+    return ta;
+}
+
 function _insertAtCursor(widget, value) {
-    const textarea = widget.inputEl;
+    const textarea = _resolveLiveTextarea(widget);
     if (!textarea) return;
     const start = textarea.selectionStart ?? textarea.value.length;
     const end = textarea.selectionEnd ?? textarea.value.length;
@@ -474,7 +513,7 @@ function _insertAtCursor(widget, value) {
 }
 
 function _onPick(widget, pathParts, leafValue) {
-    const textarea = widget.inputEl;
+    const textarea = _resolveLiveTextarea(widget);
     if (!textarea) return;
     const text = textarea.value;
 
@@ -584,9 +623,13 @@ function _installDelegation() {
     };
     document.addEventListener("mouseup", userOpen, true);
 
-    // Typing in the textarea while the dropdown is open dismisses it -
-    // user is editing, not picking.
+    // Typing in the textarea while the dropdown is open dismisses it - user
+    // is editing, not picking. isTrusted filters out the synthetic input
+    // event ComfyUI's widget.callback fires when our pick writes a value,
+    // which would otherwise close the dropdown right after each pick (and
+    // break shift-click multi-select).
     document.addEventListener("input", (ev) => {
+        if (ev.isTrusted === false) return;
         if (!_activeDropdown) return;
         if (!_activeAnchor) return;
         if (ev.target !== _activeAnchor) return;
