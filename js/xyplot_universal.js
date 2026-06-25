@@ -34,9 +34,8 @@ function _injectStyle() {
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
-.xyplot-universal-dropdown,
-.xyplot-universal-dropdown ul {
-    position: relative;
+.xyplot-universal-dropdown {
+    position: fixed;
     box-sizing: border-box;
     background-color: #171717;
     box-shadow: 0 4px 4px rgba(255, 255, 255, .25);
@@ -44,14 +43,10 @@ function _injectStyle() {
     margin: 0;
     list-style: none;
     z-index: 10000;
-    overflow: visible;
-    max-height: fit-content;
-    max-width: fit-content;
-}
-.xyplot-universal-dropdown {
-    position: absolute;
-    border-radius: 0;
     color: #ddd;
+    max-height: 60vh;
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 .xyplot-universal-dropdown li,
 .xyplot-universal-dropdown ul li {
@@ -81,11 +76,18 @@ function _injectStyle() {
     font-weight: normal;
 }
 .xyplot-universal-dropdown ul {
-    position: absolute;
-    top: 0;
-    left: 100%;
+    position: fixed;
     border: none;
     display: none;
+    background-color: #171717;
+    box-shadow: 0 4px 4px rgba(255, 255, 255, .25);
+    padding: 0;
+    margin: 0;
+    list-style: none;
+    z-index: 10001;
+    max-height: 60vh;
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 .xyplot-universal-dropdown li.selected > ul,
 .xyplot-universal-dropdown ul li.selected > ul {
@@ -316,25 +318,30 @@ function _showDropdown(inputEl, tree, onPick, clickX, clickY) {
                 const nested = document.createElement("ul");
                 li.appendChild(nested);
                 buildLevel(nested, child, [...pathParts, key]);
-                _attachWheelScroll(nested);
+                // Position the fixed submenu next to this folder item on hover.
+                li.addEventListener("mouseover", () => {
+                    const r = li.getBoundingClientRect();
+                    nested.style.left = r.right + "px";
+                    nested.style.top  = r.top  + "px";
+                });
             }
             container.appendChild(li);
         });
     };
 
     buildLevel(root, tree, []);
-    _attachWheelScroll(root);
 
     // Anchor at the click position when we have it (so the list pops where
     // the cursor is, not at the bottom of a long textbox). Fall back to the
     // textbox bottom for keyboard / programmatic opens.
+    // position:fixed → viewport coords, no scrollX/Y offset needed.
     if (clickX != null && clickY != null) {
-        root.style.left = (clickX + window.scrollX) + "px";
-        root.style.top = (clickY + window.scrollY) + "px";
+        root.style.left = clickX + "px";
+        root.style.top  = clickY + "px";
     } else {
         const rect = inputEl.getBoundingClientRect();
-        root.style.left = (rect.left + window.scrollX) + "px";
-        root.style.top = (rect.bottom + window.scrollY - 10) + "px";
+        root.style.left = rect.left + "px";
+        root.style.top  = (rect.bottom - 10) + "px";
     }
 
     document.body.appendChild(root);
